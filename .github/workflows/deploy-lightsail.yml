@@ -37,6 +37,18 @@ jobs:
           role-to-assume: arn:aws:iam::331134574228:role/GitHubActions-LightsailDeployRole
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Install lightsailctl plugin
+        run: |
+          set -euo pipefail
+          if ! command -v lightsailctl >/dev/null 2>&1; then
+            echo "Installing lightsailctl..."
+            curl -sSL https://s3.us-west-2.amazonaws.com/lightsailctl/latest/linux-amd64/lightsailctl -o lightsailctl
+            sudo install -m 0755 lightsailctl /usr/local/bin/lightsailctl
+            rm -f lightsailctl
+          else
+            echo "lightsailctl already installed"
+          fi
+
       - name: Ensure Lightsail service exists (idempotent)
         run: |
           aws lightsail create-container-service \
