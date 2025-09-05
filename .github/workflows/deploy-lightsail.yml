@@ -11,6 +11,7 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    environment: main
 
     steps:
       - name: Checkout
@@ -29,7 +30,6 @@ jobs:
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
-        with:
         with:
           role-to-assume: arn:aws:iam::331134574228:role/GitHubActions-LightsailDeployRole
           aws-region: ${{ env.AWS_REGION }}
