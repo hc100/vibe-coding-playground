@@ -1,9 +1,10 @@
 FROM nginx:1.28.0
 
-COPY default.conf /etc/nginx/conf.d/default.conf
+# NOTE: GitHub Actions ではビルドコンテキストをリポジトリ直下（.）にしているため
+# default.conf はコンテキスト相対パスで指定する。
+COPY infra/docker/nginx/default.conf /etc/nginx/conf.d/default.conf
 
 WORKDIR /var/www/html
 
 # Copy app code so Nginx can serve public assets and share same paths with PHP
 COPY backend/ /var/www/html/
-
