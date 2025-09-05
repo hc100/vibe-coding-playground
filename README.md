@@ -163,3 +163,18 @@ docker compose exec app php artisan db:seed
 メモ:
 - 初回はサービスが無ければ自動で `power=small, scale=1` で作成します（必要に応じて調整）。
 - マイグレーションは自動実行していません。デプロイ後にワンショットで実行する運用（例: メンテナンス用ジョブ）をご検討ください。
+
+### IAM 権限（AccessDenied の対処）
+
+`aws lightsail push-container-image` で `lightsail:RegisterContainerImage` の権限不足が出る場合、CI が Assume するロールに Lightsail のコンテナ関連権限を付与してください。サンプルポリシーを `infra/aws/iam/lightsail-deploy-policy.json` に用意しています。
+
+適用例（AWS 管理コンソール または IaC でロールにアタッチ）:
+
+- 許可アクション（抜粋）:
+  - `lightsail:RegisterContainerImage`
+  - `lightsail:CreateContainerServiceDeployment`
+  - `lightsail:CreateContainerService`
+  - `lightsail:UpdateContainerService`
+  - `lightsail:GetContainerServices` ほか参照系
+
+最小権限で運用する場合は、`Resource` を対象サービスに絞ることを推奨します。

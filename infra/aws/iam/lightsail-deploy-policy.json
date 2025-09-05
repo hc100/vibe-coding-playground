@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LightsailContainerDeployCore",
+      "Effect": "Allow",
+      "Action": [
+        "lightsail:CreateContainerService",
+        "lightsail:UpdateContainerService",
+        "lightsail:CreateContainerServiceDeployment",
+        "lightsail:RegisterContainerImage",
+        "lightsail:GetContainerServices",
+        "lightsail:GetContainerServiceDeployments",
+        "lightsail:GetContainerImages",
+        "lightsail:GetContainerLog",
+        "lightsail:CreateContainerServiceRegistryLogin"
+      ],
+      "Resource": [
+        "*"
+      ]
+    }
+  ]
+}
+
