@@ -1,0 +1,29 @@
+FROM php:8.4-fpm-bookworm AS base
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git curl unzip libzip-dev libpng-dev libonig-dev libxml2-dev \
+    && docker-php-ext-configure zip \
+    && docker-php-ext-install -j$(nproc) pdo_mysql mbstring exif pcntl bcmath opcache zip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Composer
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /var/www/html
+
+# Copy app code
+COPY backend/ /var/www/html/
+
+# Install PHP deps (no dev)
+RUN composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev \
+    && mkdir -p storage bootstrap/cache \
+    && chmod -R ug+rw storage bootstrap/cache
+
+# You can optionally cache configs/routes if APP_KEY is available at runtime
+# RUN php artisan config:cache && php artisan route:cache || true
+
+USER www-data
+
+CMD ["php-fpm"]
+

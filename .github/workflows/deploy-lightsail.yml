@@ -1,0 +1,124 @@
+name: Deploy to Lightsail Containers
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  LIGHTSAIL_SERVICE_NAME: ${{ secrets.LIGHTSAIL_SERVICE_NAME }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (for asset build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend assets
+        working-directory: backend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+        with:
+          role-to-assume: arn:aws:iam::331134574228:role/GitHubActions-LightsailDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure Lightsail service exists (idempotent)
+        run: |
+          aws lightsail create-container-service \
+            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --power small \
+            --scale 1 \
+          || echo "Service already exists"
+
+      - name: Build Docker images
+        run: |
+          docker build -f infra/docker/php/Dockerfile.prod -t app:${GITHUB_SHA} .
+          docker build -f infra/docker/nginx/Dockerfile.prod -t web:${GITHUB_SHA} .
+
+      - name: Push images to Lightsail (app)
+        id: push_app
+        run: |
+          aws lightsail push-container-image \
+            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --label app \
+            --image app:${GITHUB_SHA}
+
+      - name: Push images to Lightsail (web)
+        id: push_web
+        run: |
+          aws lightsail push-container-image \
+            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --label web \
+            --image web:${GITHUB_SHA}
+
+      - name: Deploy to Lightsail service
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          # Images are referred as SERVICE_NAME/label:latest in Lightsail
+          APP_IMAGE="${LIGHTSAIL_SERVICE_NAME}/app:latest"
+          WEB_IMAGE="${LIGHTSAIL_SERVICE_NAME}/web:latest"
+
+          cat > deployment.json <<'JSON'
+          {
+            "containers": {
+              "app": {
+                "image": "APP_IMAGE_PLACEHOLDER",
+                "environment": {
+                  "APP_ENV": "production",
+                  "APP_DEBUG": "false",
+                  "APP_URL": "APP_URL_PLACEHOLDER",
+                  "DB_CONNECTION": "mysql",
+                  "DB_HOST": "DB_HOST_PLACEHOLDER",
+                  "DB_PORT": "DB_PORT_PLACEHOLDER",
+                  "DB_DATABASE": "DB_DATABASE_PLACEHOLDER",
+                  "DB_USERNAME": "DB_USERNAME_PLACEHOLDER",
+                  "DB_PASSWORD": "DB_PASSWORD_PLACEHOLDER"
+                }
+              },
+              "web": {
+                "image": "WEB_IMAGE_PLACEHOLDER",
+                "ports": { "80": "HTTP" },
+                "environment": {
+                  "APP_ENV": "production"
+                }
+              }
+            },
+            "publicEndpoint": {
+              "containerName": "web",
+              "containerPort": 80
+            }
+          }
+          JSON
+
+          sed -i "s#APP_IMAGE_PLACEHOLDER#${APP_IMAGE}#g" deployment.json
+          sed -i "s#WEB_IMAGE_PLACEHOLDER#${WEB_IMAGE}#g" deployment.json
+          sed -i "s#APP_URL_PLACEHOLDER#${APP_URL}#g" deployment.json
+          sed -i "s#DB_HOST_PLACEHOLDER#${DB_HOST}#g" deployment.json
+          sed -i "s#DB_PORT_PLACEHOLDER#${DB_PORT:-3306}#g" deployment.json
+          sed -i "s#DB_DATABASE_PLACEHOLDER#${DB_DATABASE}#g" deployment.json
+          sed -i "s#DB_USERNAME_PLACEHOLDER#${DB_USERNAME}#g" deployment.json
+          sed -i "s#DB_PASSWORD_PLACEHOLDER#${DB_PASSWORD}#g" deployment.json
+
+          cat deployment.json
+
+          aws lightsail create-container-service-deployment \
+            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --cli-input-json file://deployment.json

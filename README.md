@@ -106,13 +106,60 @@ vendor/bin/pint
 ## 📁 プロジェクト構成（抜粋）
 
 ```
-app/
-├── Models/
-├── Http/
-│   └── Controllers/
-database/
-├── migrations/
-├── seeders/
-tests/
-└── Unit/
+backend/
+├── app/
+│   ├── Models/
+│   └── Http/Controllers/
+├── database/
+│   ├── migrations/
+│   └── seeders/
+├── public/
+└── tests/
 ```
+
+---
+
+## 🐳 Docker 開発環境（php-8.4 / nginx-1.28 / mysql-8.0）
+
+- 構成: `backend/` に Laravel 本体、`infra/docker/` に Dockerfile 群。
+- 起動: プロジェクト直下で `docker-compose up --build`。
+- アクセス: http://localhost:8080
+  - メール確認（MailHog）: http://localhost:8025
+
+初回セットアップ（別ターミナルで）:
+
+```
+docker compose exec app php artisan migrate
+# 必要に応じて
+docker compose exec app php artisan db:seed
+```
+
+補足:
+- `backend/.env` は Docker 用に `DB_HOST=db`、DB 名/ユーザー/パスワードは `laravel/laravel` に設定済みです。
+- メールは MailHog（SMTP）を使用するよう設定済みです（`MAIL_MAILER=smtp`、`MAIL_HOST=mailhog`、`MAIL_PORT=1025`）。
+- PHP コンテナは `vendor/` が無い場合に `composer install` を実行し、`APP_KEY` 未設定の場合は自動生成します。
+- フロント資産は `cd backend && npm ci && npm run build` でビルドしてください（Nginx は `public/` を配信）。
+
+---
+
+## 🚀 デプロイ（GitHub Actions → AWS Lightsail Containers）
+
+- 自動デプロイ: `main` ブランチへ push で実行。
+- ワークフロー: `.github/workflows/deploy-lightsail.yml`
+
+事前準備（GitHub Secrets）:
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`: Lightsail への push 権限を持つ IAM ユーザーのキー。
+- `AWS_REGION`: 例 `ap-northeast-1`。
+- `LIGHTSAIL_SERVICE_NAME`: 作成・更新対象の Lightsail コンテナサービス名。
+- `APP_URL`: 公開 URL（例 `https://example.com`）。
+- `DB_HOST`, `DB_PORT`(任意), `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`: 本番用 DB 接続情報（Lightsail マネージド DB 推奨）。
+
+ワークフローの流れ:
+- Node で `backend` のアセットをビルド。
+- 本番用 Docker イメージ（`infra/docker/*/Dockerfile.prod`）をビルド。
+- `aws lightsail push-container-image` で `app` / `web` の 2 つのラベルとして登録。
+- `create-container-service-deployment` で `web` を公開エンドポイント(80/tcp)、`app` は内部向け PHP-FPM として配置。
+
+メモ:
+- 初回はサービスが無ければ自動で `power=small, scale=1` で作成します（必要に応じて調整）。
+- マイグレーションは自動実行していません。デプロイ後にワンショットで実行する運用（例: メンテナンス用ジョブ）をご検討ください。

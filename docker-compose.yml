@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: ./infra/docker/php
+    container_name: vc_app
+    working_dir: /var/www/html
+    volumes:
+      - ./backend:/var/www/html
+    env_file:
+      - ./backend/.env
+    environment:
+      # Ensure DB connection points to the db service
+      - DB_CONNECTION=mysql
+      - DB_HOST=db
+      - DB_PORT=3306
+      - DB_DATABASE=${DB_DATABASE:-laravel}
+      - DB_USERNAME=${DB_USERNAME:-laravel}
+      - DB_PASSWORD=${DB_PASSWORD:-laravel}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./infra/docker/nginx
+    container_name: vc_web
+    ports:
+      - "80:80"
+    volumes:
+      - ./backend:/var/www/html:ro
+    depends_on:
+      - app
+
+  db:
+    image: mysql:8.0
+    container_name: vc_db
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE:-laravel}
+      MYSQL_USER: ${DB_USERNAME:-laravel}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-laravel}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${DB_ROOT_PASSWORD:-root}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: vc_mailhog
+    ports:
+      - "8025:8025" # Web UI
+    # SMTP listens on 1025 inside network; no need to expose for app
+    # App will reach it via service name `mailhog:1025`
+
+volumes:
+  db-data:

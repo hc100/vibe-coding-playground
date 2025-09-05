@@ -1,0 +1,12 @@
+.git
+.github
+*.log
+node_modules
+backend/node_modules
+backend/storage
+backend/vendor
+backend/tests
+backend/.env
+backend/.env.*
+error*.png
+*.sqlite
