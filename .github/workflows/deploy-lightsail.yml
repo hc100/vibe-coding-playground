@@ -10,7 +10,7 @@ permissions:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  LIGHTSAIL_SERVICE_NAME: ${{ secrets.LIGHTSAIL_SERVICE_NAME }}
+  LIGHTSAIL_SERVICE: ${{ secrets.LIGHTSAIL_SERVICE }}
 
 jobs:
   build-and-deploy:
@@ -49,10 +49,25 @@ jobs:
             echo "lightsailctl already installed"
           fi
 
+      - name: Resolve Lightsail service name
+        run: |
+          set -euo pipefail
+          SERVICE_NAME="${{ secrets.LIGHTSAIL_SERVICE }}"
+          if [ -z "$SERVICE_NAME" ]; then
+            SERVICE_NAME="${{ vars.LIGHTSAIL_SERVICE }}"
+          fi
+          if [ -z "$SERVICE_NAME" ]; then
+            echo "ERROR: LIGHTSAIL_SERVICE is not set in secrets or repository variables."
+            echo "Set 'LIGHTSAIL_SERVICE' in GitHub Secrets or Repository Variables."
+            exit 1
+          fi
+          echo "LIGHTSAIL_SERVICE=$SERVICE_NAME" >> "$GITHUB_ENV"
+          echo "Resolved service name: $SERVICE_NAME"
+
       - name: Ensure Lightsail service exists (idempotent)
         run: |
           aws lightsail create-container-service \
-            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --service-name "$LIGHTSAIL_SERVICE" \
             --power small \
             --scale 1 \
           || echo "Service already exists"
@@ -66,7 +81,7 @@ jobs:
         id: push_app
         run: |
           aws lightsail push-container-image \
-            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --service-name "$LIGHTSAIL_SERVICE" \
             --label app \
             --image app:${GITHUB_SHA}
 
@@ -74,7 +89,7 @@ jobs:
         id: push_web
         run: |
           aws lightsail push-container-image \
-            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --service-name "$LIGHTSAIL_SERVICE" \
             --label web \
             --image web:${GITHUB_SHA}
 
@@ -88,8 +103,8 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           # Images are referred as SERVICE_NAME/label:latest in Lightsail
-          APP_IMAGE="${LIGHTSAIL_SERVICE_NAME}/app:latest"
-          WEB_IMAGE="${LIGHTSAIL_SERVICE_NAME}/web:latest"
+          APP_IMAGE="${LIGHTSAIL_SERVICE}/app:latest"
+          WEB_IMAGE="${LIGHTSAIL_SERVICE}/web:latest"
 
           cat > deployment.json <<'JSON'
           {
@@ -135,5 +150,5 @@ jobs:
           cat deployment.json
 
           aws lightsail create-container-service-deployment \
-            --service-name "$LIGHTSAIL_SERVICE_NAME" \
+            --service-name "$LIGHTSAIL_SERVICE" \
             --cli-input-json file://deployment.json
