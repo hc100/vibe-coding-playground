@@ -1,0 +1,225 @@
+name: Deploy to Amazon ECS
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # for OIDC federation to AWS
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+  # ECR repositories (name only, not full URI)
+  ECR_REPO_APP: ${{ secrets.ECR_REPO_APP }}
+  ECR_REPO_WEB: ${{ secrets.ECR_REPO_WEB }}
+
+  # ECS cluster/service
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+
+  # Task roles
+  ECS_TASK_EXECUTION_ROLE_ARN: ${{ secrets.ECS_TASK_EXECUTION_ROLE_ARN }}
+  ECS_TASK_ROLE_ARN: ${{ secrets.ECS_TASK_ROLE_ARN }}
+
+  # Networking (comma-separated IDs)
+  ECS_SUBNETS: ${{ secrets.ECS_SUBNETS }}
+  ECS_SECURITY_GROUPS: ${{ secrets.ECS_SECURITY_GROUPS }}
+
+  # CloudWatch Logs
+  LOG_GROUP_NAME: ${{ secrets.LOG_GROUP_NAME }}
+
+  # Secrets Manager (single JSON secret ARN with keys below)
+  LARAVEL_SECRETS_ARN: ${{ secrets.LARAVEL_SECRETS_ARN }}
+
+  # Task family/capacity
+  TASK_FAMILY: laravel-fargate
+  TASK_CPU: ${{ vars.TASK_CPU }}
+  TASK_MEMORY: ${{ vars.TASK_MEMORY }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: main
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (for asset build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend assets
+        working-directory: backend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker images (php-fpm, nginx)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          APP_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_APP}:${IMAGE_TAG}"
+          WEB_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_WEB}:${IMAGE_TAG}"
+          echo "APP_IMAGE_URI=$APP_URI" >> "$GITHUB_ENV"
+          echo "WEB_IMAGE_URI=$WEB_URI" >> "$GITHUB_ENV"
+
+          # Build images
+          docker build -f infra/docker/php/Dockerfile.prod -t app:${IMAGE_TAG} .
+          docker build -f infra/docker/nginx/Dockerfile.prod -t web:${IMAGE_TAG} .
+
+          # Tag for ECR
+          docker tag app:${IMAGE_TAG} "$APP_URI"
+          docker tag web:${IMAGE_TAG} "$WEB_URI"
+
+          # Push to ECR
+          docker push "$APP_URI"
+          docker push "$WEB_URI"
+
+      - name: Prepare ECS task definition JSON
+        id: taskdef
+        run: |
+          set -euo pipefail
+
+          # Defaults if not provided as repository variables
+          CPU="${TASK_CPU:-512}"
+          MEMORY="${TASK_MEMORY:-1024}"
+
+          # Region for logs
+          LOG_REGION="${AWS_REGION}"
+
+          cat > taskdef.json << JSON
+          {
+            "family": "${TASK_FAMILY}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "${CPU}",
+            "memory": "${MEMORY}",
+            "taskRoleArn": "${ECS_TASK_ROLE_ARN}",
+            "executionRoleArn": "${ECS_TASK_EXECUTION_ROLE_ARN}",
+            "runtimePlatform": {"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
+            "containerDefinitions": [
+              {
+                "name": "app",
+                "image": "${APP_IMAGE_URI}",
+                "essential": true,
+                "portMappings": [ { "containerPort": 9000, "protocol": "tcp" } ],
+                "environment": [
+                  {"name": "APP_ENV", "value": "production"},
+                  {"name": "APP_DEBUG", "value": "false"}
+                ],
+                "secrets": [
+                  {"name": "APP_KEY",      "valueFrom": "${LARAVEL_SECRETS_ARN}:APP_KEY::"},
+                  {"name": "APP_URL",      "valueFrom": "${LARAVEL_SECRETS_ARN}:APP_URL::"},
+                  {"name": "DB_CONNECTION", "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_CONNECTION::"},
+                  {"name": "DB_HOST",      "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_HOST::"},
+                  {"name": "DB_PORT",      "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_PORT::"},
+                  {"name": "DB_DATABASE",  "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_DATABASE::"},
+                  {"name": "DB_USERNAME",  "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_USERNAME::"},
+                  {"name": "DB_PASSWORD",  "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_PASSWORD::"}
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "${LOG_GROUP_NAME}",
+                    "awslogs-region": "${LOG_REGION}",
+                    "awslogs-stream-prefix": "app"
+                  }
+                }
+              },
+              {
+                "name": "web",
+                "image": "${WEB_IMAGE_URI}",
+                "essential": true,
+                "portMappings": [ { "containerPort": 80, "protocol": "tcp" } ],
+                "dependsOn": [ { "containerName": "app", "condition": "START" } ],
+                "environment": [ {"name": "APP_ENV", "value": "production"} ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "${LOG_GROUP_NAME}",
+                    "awslogs-region": "${LOG_REGION}",
+                    "awslogs-stream-prefix": "web"
+                  }
+                }
+              }
+            ]
+          }
+          JSON
+
+          echo "Wrote taskdef.json:" && cat taskdef.json
+
+      - name: Register task definition
+        id: register
+        run: |
+          set -euo pipefail
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" | tee -a "$GITHUB_ENV"
+
+      - name: Run DB migrations (one-off Fargate task)
+        env:
+          OVERRIDES: |
+            {"containerOverrides":[{"name":"app","command":["php","artisan","migrate","--force"]}]}
+        run: |
+          set -euo pipefail
+          if [ -z "${ECS_SUBNETS}" ] || [ -z "${ECS_SECURITY_GROUPS}" ]; then
+            echo "ECS_SUBNETS or ECS_SECURITY_GROUPS not set. Skipping migrations."
+            exit 0
+          fi
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --launch-type FARGATE \
+            --task-definition "$TASK_DEF_ARN" \
+            --count 1 \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}" \
+            --overrides "$OVERRIDES" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "Migration task: $TASK_ARN"
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[?name==`app`].exitCode' --output text)
+          echo "Migration exit code: $EXIT_CODE"
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "Migrations failed. Aborting deploy." >&2
+            exit 1
+          fi
+
+      - name: Update ECS service to new task definition
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEF_ARN" \
+            --force-new-deployment \
+            --query 'service.serviceName' --output text
+
+      - name: Wait for service stability
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "ECS service is stable."
+
