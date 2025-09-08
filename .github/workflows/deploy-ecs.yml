@@ -66,6 +66,22 @@ jobs:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          required=(AWS_REGION AWS_ACCOUNT_ID ECR_REPO_APP ECR_REPO_WEB ECS_CLUSTER ECS_SERVICE LOG_GROUP_NAME LARAVEL_SECRETS_ARN ECS_TASK_EXECUTION_ROLE_ARN)
+          for v in "${required[@]}"; do
+            if [ -z "${!v:-}" ]; then
+              missing+=("$v")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "ERROR: Missing required secrets/vars: ${missing[*]}" >&2
+            echo "Please set them in GitHub → Settings → Secrets and variables → Actions." >&2
+            exit 1
+          fi
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -105,6 +121,13 @@ jobs:
           # Region for logs
           LOG_REGION="${AWS_REGION}"
 
+          # Include taskRoleArn only when provided
+          if [ -n "${ECS_TASK_ROLE_ARN:-}" ]; then
+            TASK_ROLE_LINE="\"taskRoleArn\": \"${ECS_TASK_ROLE_ARN}\","
+          else
+            TASK_ROLE_LINE=""
+          fi
+
           cat > taskdef.json << JSON
           {
             "family": "${TASK_FAMILY}",
@@ -112,7 +135,7 @@ jobs:
             "requiresCompatibilities": ["FARGATE"],
             "cpu": "${CPU}",
             "memory": "${MEMORY}",
-            "taskRoleArn": "${ECS_TASK_ROLE_ARN}",
+            ${TASK_ROLE_LINE}
             "executionRoleArn": "${ECS_TASK_EXECUTION_ROLE_ARN}",
             "runtimePlatform": {"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
             "containerDefinitions": [
@@ -199,9 +222,27 @@ jobs:
 
           echo "Migration task: $TASK_ARN"
           aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+          echo "--- Describe task (diagnostics) ---"
+          aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].{lastStatus:lastStatus,stopCode:stopCode,stoppedReason:stoppedReason,containers:containers[].{name:name,lastStatus:lastStatus,reason:reason,exitCode:exitCode,logStreamName:logStreamName}}' \
+            --output json || true
           EXIT_CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
             --query 'tasks[0].containers[?name==`app`].exitCode' --output text)
           echo "Migration exit code: $EXIT_CODE"
+          if [ -z "${EXIT_CODE}" ]; then
+            echo "No exit code for 'app'. Printing stoppedReason and container reason..." >&2
+            STOPPED_REASON=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0].stoppedReason' --output text || true)
+            CONTAINER_REASON=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0].containers[?name==`app`].reason' --output text || true)
+            echo "Task stoppedReason: ${STOPPED_REASON}" >&2
+            echo "Container(app) reason: ${CONTAINER_REASON}" >&2
+            LOG_STREAM=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" --query 'tasks[0].containers[?name==`app`].logStreamName' --output text || true)
+            if [ -n "$LOG_STREAM" ] && [ "$LOG_STREAM" != "None" ]; then
+              echo "--- Last 100 log lines from $LOG_GROUP_NAME / $LOG_STREAM ---" >&2
+              aws logs get-log-events --log-group-name "$LOG_GROUP_NAME" --log-stream-name "$LOG_STREAM" --limit 100 --query 'events[].message' --output text || true
+            else
+              echo "No log stream available. Ensure log group exists and execution role can write logs." >&2
+            fi
+          fi
           if [ "${EXIT_CODE}" != "0" ]; then
             echo "Migrations failed. Aborting deploy." >&2
             exit 1
@@ -222,4 +263,3 @@ jobs:
           set -euo pipefail
           aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
           echo "ECS service is stable."
-
