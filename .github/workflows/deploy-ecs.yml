@@ -84,6 +84,16 @@ jobs:
             exit 1
           fi
 
+      - name: Ensure CloudWatch Logs group exists
+        run: |
+          set -euo pipefail
+          if ! aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" --query 'logGroups[?logGroupName==`'$LOG_GROUP_NAME'`]' --output text | grep -q "$LOG_GROUP_NAME"; then
+            echo "Creating log group: $LOG_GROUP_NAME"
+            aws logs create-log-group --log-group-name "$LOG_GROUP_NAME" || true
+          else
+            echo "Log group already exists: $LOG_GROUP_NAME"
+          fi
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -253,7 +263,7 @@ jobs:
                     "awslogs-stream-prefix": "migrate"
                   }
                 },
-                "command": ["php","artisan","migrate","--force"]
+                "command": ["php","artisan","migrate","--force","-vvv"]
               }
             ]
           }
