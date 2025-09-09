@@ -17,7 +17,8 @@ COPY backend/ /var/www/html/
 
 # Install PHP deps (no dev)
 RUN composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev \
-    && mkdir -p storage bootstrap/cache \
+    && mkdir -p storage storage/logs bootstrap/cache \
+    && chown -R www-data:www-data storage bootstrap/cache \
     && chmod -R ug+rw storage bootstrap/cache
 
 # You can optionally cache configs/routes if APP_KEY is available at runtime
@@ -26,4 +27,3 @@ RUN composer install --no-interaction --prefer-dist --optimize-autoloader --no-d
 USER www-data
 
 CMD ["php-fpm"]
-
