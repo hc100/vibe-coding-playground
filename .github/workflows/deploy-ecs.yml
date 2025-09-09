@@ -40,6 +40,8 @@ env:
   TASK_FAMILY: laravel-fargate
   TASK_CPU: ${{ vars.TASK_CPU }}
   TASK_MEMORY: ${{ vars.TASK_MEMORY }}
+  MIGRATE_TASK_CPU: ${{ vars.MIGRATE_TASK_CPU }}
+  MIGRATE_TASK_MEMORY: ${{ vars.MIGRATE_TASK_MEMORY }}
 
 jobs:
   build-and-deploy:
@@ -199,10 +201,76 @@ jobs:
             --output text)
           echo "TASK_DEF_ARN=$TASK_DEF_ARN" | tee -a "$GITHUB_ENV"
 
+      - name: Prepare migration-only task definition JSON
+        id: taskdef-migrate
+        run: |
+          set -euo pipefail
+
+          CPU="${MIGRATE_TASK_CPU:-1024}"
+          MEMORY="${MIGRATE_TASK_MEMORY:-2048}"
+          LOG_REGION="${AWS_REGION}"
+
+          if [ -n "${ECS_TASK_ROLE_ARN:-}" ]; then
+            TASK_ROLE_LINE="\"taskRoleArn\": \"${ECS_TASK_ROLE_ARN}\","
+          else
+            TASK_ROLE_LINE=""
+          fi
+
+          cat > taskdef.migrate.json << JSON
+          {
+            "family": "${TASK_FAMILY}-migrate",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "${CPU}",
+            "memory": "${MEMORY}",
+            ${TASK_ROLE_LINE}
+            "executionRoleArn": "${ECS_TASK_EXECUTION_ROLE_ARN}",
+            "runtimePlatform": {"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
+            "containerDefinitions": [
+              {
+                "name": "app",
+                "image": "${APP_IMAGE_URI}",
+                "essential": true,
+                "environment": [
+                  {"name": "APP_ENV", "value": "production"},
+                  {"name": "APP_DEBUG", "value": "false"}
+                ],
+                "secrets": [
+                  {"name": "APP_KEY",      "valueFrom": "${LARAVEL_SECRETS_ARN}:APP_KEY::"},
+                  {"name": "APP_URL",      "valueFrom": "${LARAVEL_SECRETS_ARN}:APP_URL::"},
+                  {"name": "DB_CONNECTION", "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_CONNECTION::"},
+                  {"name": "DB_HOST",      "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_HOST::"},
+                  {"name": "DB_PORT",      "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_PORT::"},
+                  {"name": "DB_DATABASE",  "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_DATABASE::"},
+                  {"name": "DB_USERNAME",  "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_USERNAME::"},
+                  {"name": "DB_PASSWORD",  "valueFrom": "${LARAVEL_SECRETS_ARN}:DB_PASSWORD::"}
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "${LOG_GROUP_NAME}",
+                    "awslogs-region": "${LOG_REGION}",
+                    "awslogs-stream-prefix": "migrate"
+                  }
+                },
+                "command": ["php","artisan","migrate","--force"]
+              }
+            ]
+          }
+          JSON
+
+          echo "Wrote taskdef.migrate.json:" && cat taskdef.migrate.json
+
+          MIGRATE_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.migrate.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "MIGRATE_TASK_DEF_ARN=$MIGRATE_TASK_DEF_ARN" | tee -a "$GITHUB_ENV"
+
       - name: Run DB migrations (one-off Fargate task)
         env:
           OVERRIDES: |
-            {"containerOverrides":[{"name":"app","command":["php","artisan","migrate","--force"]}]}
+            {"containerOverrides":[]}
         run: |
           set -euo pipefail
           if [ -z "${ECS_SUBNETS}" ] || [ -z "${ECS_SECURITY_GROUPS}" ]; then
@@ -212,7 +280,7 @@ jobs:
           TASK_ARN=$(aws ecs run-task \
             --cluster "$ECS_CLUSTER" \
             --launch-type FARGATE \
-            --task-definition "$TASK_DEF_ARN" \
+            --task-definition "$MIGRATE_TASK_DEF_ARN" \
             --count 1 \
             --platform-version LATEST \
             --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}" \
