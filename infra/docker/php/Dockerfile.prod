@@ -12,12 +12,19 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /var/www/html
 
-# Copy app code
+# Install PHP deps (no dev) with better layer caching
+# 1) Copy only composer files first to leverage Docker layer cache
+COPY backend/composer.json backend/composer.lock /var/www/html/
+RUN composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev \
+    && rm -rf vendor/*/.git
+
+# 2) Copy application source
 COPY backend/ /var/www/html/
 
-# Install PHP deps (no dev)
-RUN composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev \
-    && mkdir -p storage storage/logs bootstrap/cache \
+# 3) Ensure writable paths exist with proper ownership/permissions
+RUN mkdir -p storage/logs \
+    && mkdir -p storage/framework/sessions storage/framework/views storage/framework/cache/data \
+    && mkdir -p bootstrap/cache \
     && chown -R www-data:www-data storage bootstrap/cache \
     && chmod -R ug+rw storage bootstrap/cache
 

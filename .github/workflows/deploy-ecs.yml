@@ -5,6 +5,10 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   id-token: write   # for OIDC federation to AWS
   contents: read
@@ -55,9 +59,27 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Determine changed parts
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filters: |
+            frontend:
+              - 'backend/package.json'
+              - 'backend/package-lock.json'
+              - 'backend/vite.config.*'
+              - 'backend/resources/**'
+              - 'backend/public/**'
+            migrations:
+              - 'backend/database/migrations/**'
 
       - name: Build frontend assets
         working-directory: backend
+        if: steps.changes.outputs.frontend == 'true'
         run: |
           npm ci
           npm run build
@@ -148,28 +170,39 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker images (php-fpm, nginx)
+      - name: Set image URIs
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          set -euo pipefail
-
           APP_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_APP}:${IMAGE_TAG}"
           WEB_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_WEB}:${IMAGE_TAG}"
           echo "APP_IMAGE_URI=$APP_URI" >> "$GITHUB_ENV"
           echo "WEB_IMAGE_URI=$WEB_URI" >> "$GITHUB_ENV"
 
-          # Build images
-          docker build -f infra/docker/php/Dockerfile.prod -t app:${IMAGE_TAG} .
-          docker build -f infra/docker/nginx/Dockerfile.prod -t web:${IMAGE_TAG} .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-          # Tag for ECR
-          docker tag app:${IMAGE_TAG} "$APP_URI"
-          docker tag web:${IMAGE_TAG} "$WEB_URI"
+      - name: Build and push app image (php-fpm) with cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/docker/php/Dockerfile.prod
+          push: true
+          tags: ${{ env.APP_IMAGE_URI }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
 
-          # Push to ECR
-          docker push "$APP_URI"
-          docker push "$WEB_URI"
+      - name: Build and push web image (nginx) with cache
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/docker/nginx/Dockerfile.prod
+          push: true
+          tags: ${{ env.WEB_IMAGE_URI }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
 
       - name: Prepare ECS task definition JSON
         id: taskdef
@@ -333,6 +366,11 @@ jobs:
             {"containerOverrides":[]}
         run: |
           set -euo pipefail
+          # Skip when no migration files changed in this push
+          if [ "${{ steps.changes.outputs.migrations }}" != "true" ]; then
+            echo "No migration changes detected. Skipping migrations."
+            exit 0
+          fi
           if [ -z "${ECS_SUBNETS}" ] || [ -z "${ECS_SECURITY_GROUPS}" ]; then
             echo "ECS_SUBNETS or ECS_SECURITY_GROUPS not set. Skipping migrations."
             exit 0
@@ -387,6 +425,7 @@ jobs:
             --query 'service.serviceName' --output text
 
       - name: Wait for service stability
+        if: ${{ vars.WAIT_STABLE != 'false' }}
         run: |
           set -euo pipefail
           aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
