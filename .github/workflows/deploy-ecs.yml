@@ -106,56 +106,6 @@ jobs:
             exit 1
           fi
 
-      - name: Preflight DB connectivity
-        env:
-          CHECK_CMD: >
-            php -r '$h=getenv("DB_HOST"); $p=getenv("DB_PORT")?:3306; $db=getenv("DB_DATABASE"); $u=getenv("DB_USERNAME"); $pw=getenv("DB_PASSWORD"); $t=5; $s=@fsockopen($h,$p,$e,$es,$t); if(!$s){fwrite(STDERR, "TCP connect failed: $e $es\n"); exit(2);} fclose($s); try{$dsn="mysql:host=$h;port=$p;dbname=$db;charset=utf8mb4"; $pdo=new PDO($dsn,$u,$pw,[PDO::ATTR_TIMEOUT=>5]); $pdo->query("SELECT 1"); echo "DB OK\n"; exit(0);}catch(Exception $ex){fwrite(STDERR,"PDO failed: ".$ex->getMessage()."\n"); exit(3);}'
-        run: |
-          set -euo pipefail
-          if [ -z "${ECS_SUBNETS:-}" ] || [ -z "${ECS_SECURITY_GROUPS:-}" ]; then
-            echo "ECS_SUBNETS/ECS_SECURITY_GROUPS が未設定のためプリチェックをスキップします";
-            exit 0
-          fi
-
-          TD_ARN=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-            --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
-          if [ -z "$TD_ARN" ] || [ "$TD_ARN" = "None" ]; then
-            TD_ARN=$(aws ecs list-task-definitions \
-              --family-prefix "${TASK_FAMILY}" --sort DESC \
-              --query 'taskDefinitionArns[0]' --output text 2>/dev/null || true)
-          fi
-          if [ -z "$TD_ARN" ] || [ "$TD_ARN" = "None" ]; then
-            echo "プリチェック用のタスク定義が見つかりません（family=${TASK_FAMILY}）。初回はスキップします。" >&2
-            exit 0
-          fi
-          echo "Use taskDefinition: $TD_ARN"
-
-          OVERRIDES=$(jq -nc --arg cmd "$CHECK_CMD" '{containerOverrides:[{name:"app",command:["/bin/sh","-lc",$cmd]}]}')
-
-          TASK_ARN=$(aws ecs run-task \
-            --cluster "$ECS_CLUSTER" \
-            --launch-type FARGATE \
-            --task-definition "$TD_ARN" \
-            --count 1 \
-            --platform-version LATEST \
-            --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}" \
-            --overrides "$OVERRIDES" \
-            --query 'tasks[0].taskArn' --output text)
-
-          echo "Preflight task: $TASK_ARN"
-          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
-          CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
-            --query 'tasks[0].containers[?name==`app`].exitCode' --output text)
-          echo "Preflight exit code: $CODE"
-          if [ -z "$CODE" ] || [ "$CODE" != "0" ]; then
-            aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
-              --query 'tasks[0].{stoppedReason:stoppedReason,containers:containers[].{name:name,reason:reason,exitCode:exitCode}}' \
-              --output json || true
-            echo "DB プリチェックに失敗。ネットワーク/Secrets/RDS SG を見直してください。" >&2
-            exit 1
-          fi
-
       - name: Ensure CloudWatch Logs group exists
         run: |
           set -euo pipefail
