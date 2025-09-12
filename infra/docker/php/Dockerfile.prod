@@ -15,11 +15,15 @@ WORKDIR /var/www/html
 # Install PHP deps (no dev) with better layer caching
 # 1) Copy only composer files first to leverage Docker layer cache
 COPY backend/composer.json backend/composer.lock /var/www/html/
-RUN composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev \
+# Install vendor deps without running composer scripts (artisan not yet present)
+RUN composer install --no-interaction --prefer-dist --no-dev --no-scripts --optimize-autoloader \
     && rm -rf vendor/*/.git
 
 # 2) Copy application source
 COPY backend/ /var/www/html/
+
+# Refresh autoload after copying source (still avoid composer scripts)
+RUN composer dump-autoload --no-interaction --optimize --no-dev --no-scripts
 
 # 3) Ensure writable paths exist with proper ownership/permissions
 RUN mkdir -p storage/logs \
