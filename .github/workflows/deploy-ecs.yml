@@ -5,10 +5,6 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   id-token: write   # for OIDC federation to AWS
   contents: read
@@ -59,27 +55,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: backend/package-lock.json
-
-      - name: Determine changed parts
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          filters: |
-            frontend:
-              - 'backend/package.json'
-              - 'backend/package-lock.json'
-              - 'backend/vite.config.*'
-              - 'backend/resources/**'
-              - 'backend/public/**'
-            migrations:
-              - 'backend/database/migrations/**'
 
       - name: Build frontend assets
         working-directory: backend
-        if: steps.changes.outputs.frontend == 'true'
         run: |
           npm ci
           npm run build
@@ -106,6 +84,56 @@ jobs:
             exit 1
           fi
 
+      - name: Preflight DB connectivity
+        env:
+          CHECK_CMD: >
+            php -r '$h=getenv("DB_HOST"); $p=getenv("DB_PORT")?:3306; $db=getenv("DB_DATABASE"); $u=getenv("DB_USERNAME"); $pw=getenv("DB_PASSWORD"); $t=5; $s=@fsockopen($h,$p,$e,$es,$t); if(!$s){fwrite(STDERR, "TCP connect failed: $e $es\n"); exit(2);} fclose($s); try{$dsn="mysql:host=$h;port=$p;dbname=$db;charset=utf8mb4"; $pdo=new PDO($dsn,$u,$pw,[PDO::ATTR_TIMEOUT=>5]); $pdo->query("SELECT 1"); echo "DB OK\n"; exit(0);}catch(Exception $ex){fwrite(STDERR,"PDO failed: ".$ex->getMessage()."\n"); exit(3);}'
+        run: |
+          set -euo pipefail
+          if [ -z "${ECS_SUBNETS:-}" ] || [ -z "${ECS_SECURITY_GROUPS:-}" ]; then
+            echo "ECS_SUBNETS/ECS_SECURITY_GROUPS が未設定のためプリチェックをスキップします";
+            exit 0
+          fi
+
+          TD_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
+          if [ -z "$TD_ARN" ] || [ "$TD_ARN" = "None" ]; then
+            TD_ARN=$(aws ecs list-task-definitions \
+              --family-prefix "${TASK_FAMILY}" --sort DESC \
+              --query 'taskDefinitionArns[0]' --output text 2>/dev/null || true)
+          fi
+          if [ -z "$TD_ARN" ] || [ "$TD_ARN" = "None" ]; then
+            echo "プリチェック用のタスク定義が見つかりません（family=${TASK_FAMILY}）。初回はスキップします。" >&2
+            exit 0
+          fi
+          echo "Use taskDefinition: $TD_ARN"
+
+          OVERRIDES=$(jq -nc --arg cmd "$CHECK_CMD" '{containerOverrides:[{name:"app",command:["/bin/sh","-lc",$cmd]}]}')
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --launch-type FARGATE \
+            --task-definition "$TD_ARN" \
+            --count 1 \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}" \
+            --overrides "$OVERRIDES" \
+            --query 'tasks[0].taskArn' --output text)
+
+          echo "Preflight task: $TASK_ARN"
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+          CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[?name==`app`].exitCode' --output text)
+          echo "Preflight exit code: $CODE"
+          if [ -z "$CODE" ] || [ "$CODE" != "0" ]; then
+            aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+              --query 'tasks[0].{stoppedReason:stoppedReason,containers:containers[].{name:name,reason:reason,exitCode:exitCode}}' \
+              --output json || true
+            echo "DB プリチェックに失敗。ネットワーク/Secrets/RDS SG を見直してください。" >&2
+            exit 1
+          fi
+
       - name: Ensure CloudWatch Logs group exists
         run: |
           set -euo pipefail
@@ -120,39 +148,28 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image URIs
+      - name: Build and push Docker images (php-fpm, nginx)
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          set -euo pipefail
+
           APP_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_APP}:${IMAGE_TAG}"
           WEB_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_WEB}:${IMAGE_TAG}"
           echo "APP_IMAGE_URI=$APP_URI" >> "$GITHUB_ENV"
           echo "WEB_IMAGE_URI=$WEB_URI" >> "$GITHUB_ENV"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          # Build images
+          docker build -f infra/docker/php/Dockerfile.prod -t app:${IMAGE_TAG} .
+          docker build -f infra/docker/nginx/Dockerfile.prod -t web:${IMAGE_TAG} .
 
-      - name: Build and push app image (php-fpm) with cache
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: infra/docker/php/Dockerfile.prod
-          push: true
-          tags: ${{ env.APP_IMAGE_URI }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
+          # Tag for ECR
+          docker tag app:${IMAGE_TAG} "$APP_URI"
+          docker tag web:${IMAGE_TAG} "$WEB_URI"
 
-      - name: Build and push web image (nginx) with cache
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: infra/docker/nginx/Dockerfile.prod
-          push: true
-          tags: ${{ env.WEB_IMAGE_URI }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
+          # Push to ECR
+          docker push "$APP_URI"
+          docker push "$WEB_URI"
 
       - name: Prepare ECS task definition JSON
         id: taskdef
@@ -316,11 +333,6 @@ jobs:
             {"containerOverrides":[]}
         run: |
           set -euo pipefail
-          # Skip when no migration files changed in this push
-          if [ "${{ steps.changes.outputs.migrations }}" != "true" ]; then
-            echo "No migration changes detected. Skipping migrations."
-            exit 0
-          fi
           if [ -z "${ECS_SUBNETS}" ] || [ -z "${ECS_SECURITY_GROUPS}" ]; then
             echo "ECS_SUBNETS or ECS_SECURITY_GROUPS not set. Skipping migrations."
             exit 0
@@ -375,7 +387,6 @@ jobs:
             --query 'service.serviceName' --output text
 
       - name: Wait for service stability
-        if: ${{ vars.WAIT_STABLE != 'false' }}
         run: |
           set -euo pipefail
           aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
