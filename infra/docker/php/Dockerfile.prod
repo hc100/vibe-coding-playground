@@ -1,3 +1,22 @@
+# Frontend build stage
+FROM node:18-bookworm-slim AS frontend-build
+
+WORKDIR /app
+
+# Copy package files
+COPY backend/package.json backend/package-lock.json ./
+RUN npm ci
+
+# Copy frontend source files
+COPY backend/resources/ ./resources/
+COPY backend/vite.config.js ./
+COPY backend/postcss.config.js ./
+COPY backend/tailwind.config.js ./
+
+# Build frontend assets
+RUN npm run build
+
+# PHP runtime stage
 FROM php:8.4-fpm-bookworm AS base
 
 RUN apt-get update \
@@ -22,15 +41,19 @@ RUN composer install --no-interaction --prefer-dist --no-dev --no-scripts --opti
 # 2) Copy application source
 COPY backend/ /var/www/html/
 
+# 3) Copy built frontend assets from frontend-build stage
+COPY --from=frontend-build /app/public/build /var/www/html/public/build
+
 # Refresh autoload after copying source (still avoid composer scripts)
 RUN composer dump-autoload --no-interaction --optimize --no-dev --no-scripts
 
-# 3) Ensure writable paths exist with proper ownership/permissions
+# 4) Ensure writable paths exist with proper ownership/permissions
 RUN mkdir -p storage/logs \
     && mkdir -p storage/framework/sessions storage/framework/views storage/framework/cache/data \
     && mkdir -p bootstrap/cache \
-    && chown -R www-data:www-data storage bootstrap/cache \
-    && chmod -R ug+rw storage bootstrap/cache
+    && chown -R www-data:www-data storage bootstrap/cache public/build \
+    && chmod -R ug+rw storage bootstrap/cache \
+    && chmod -R o+r public/build
 
 # You can optionally cache configs/routes if APP_KEY is available at runtime
 # RUN php artisan config:cache && php artisan route:cache || true
